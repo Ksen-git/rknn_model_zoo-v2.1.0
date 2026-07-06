@@ -12,9 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-/*-------------------------------------------
-                Includes
--------------------------------------------*/
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -26,18 +23,10 @@
 #include "image_drawing.h"
 #include <chrono>
 
-// Benchmark timing accumulators from yolov8.cc
 extern double g_preprocess_ms;
 extern double g_inference_ms;
 extern double g_postprocess_ms;
 
-#if defined(RV1106_1103) 
-    #include "dma_alloc.hpp"
-#endif
-
-/*-------------------------------------------
-                  Main Function
--------------------------------------------*/
 int main(int argc, char **argv)
 {
     if (argc != 3)
@@ -65,19 +54,6 @@ int main(int argc, char **argv)
     image_buffer_t src_image;
     memset(&src_image, 0, sizeof(image_buffer_t));
     ret = read_image(image_path, &src_image);
-
-#if defined(RV1106_1103) 
-    //RV1106 rga requires that input and output bufs are memory allocated by dma
-    ret = dma_buf_alloc(RV1106_CMA_HEAP_PATH, src_image.size, &rknn_app_ctx.img_dma_buf.dma_buf_fd, 
-                       (void **) & (rknn_app_ctx.img_dma_buf.dma_buf_virt_addr));
-    memcpy(rknn_app_ctx.img_dma_buf.dma_buf_virt_addr, src_image.virt_addr, src_image.size);
-    dma_sync_cpu_to_device(rknn_app_ctx.img_dma_buf.dma_buf_fd);
-    free(src_image.virt_addr);
-    src_image.virt_addr = (unsigned char *)rknn_app_ctx.img_dma_buf.dma_buf_virt_addr;
-    src_image.fd = rknn_app_ctx.img_dma_buf.dma_buf_fd;
-    rknn_app_ctx.img_dma_buf.size = src_image.size;
-#endif
-    
     if (ret != 0)
     {
         printf("read image fail! ret=%d image_path=%s\n", ret, image_path);
@@ -85,8 +61,9 @@ int main(int argc, char **argv)
     }
 
     object_detect_result_list od_results;
+    const int LOOP_COUNT = 100;
 
-    // ===== Benchmark: Warm-up 5 times (not timed) =====
+    // Warm-up 5 times
     printf("\nWarm-up 5 times...\n");
     for (int w = 0; w < 5; w++)
     {
@@ -99,14 +76,12 @@ int main(int argc, char **argv)
     }
     printf("Warm-up done.\n");
 
-    // Reset accumulators before formal benchmark
+    // Reset accumulators
     g_preprocess_ms = 0.0;
-    g_inference_ms  = 0.0;
+    g_inference_ms = 0.0;
     g_postprocess_ms = 0.0;
 
-    // ===== Benchmark: 100 loops (timed) =====
-    const int LOOP_COUNT = 100;
-
+    // Benchmark
     printf("\nBenchmark: running %d loops...\n", LOOP_COUNT);
     for (int loop = 0; loop < LOOP_COUNT; loop++)
     {
@@ -116,23 +91,19 @@ int main(int argc, char **argv)
             printf("inference_yolov8_model fail at loop %d! ret=%d\n", loop, ret);
             goto out;
         }
-
         if ((loop + 1) % 10 == 0)
-        {
             printf("  %d/%d done\n", loop + 1, LOOP_COUNT);
-        }
     }
 
-    // ===== Calculate average from cumulative totals =====
+    // Calculate averages
     double avg_pre = g_preprocess_ms / LOOP_COUNT;
     double avg_inf = g_inference_ms / LOOP_COUNT;
     double avg_post = g_postprocess_ms / LOOP_COUNT;
-    double avg_total = avg_pre + avg_inf + avg_post;
     double total_all = g_preprocess_ms + g_inference_ms + g_postprocess_ms;
+    double avg_total = avg_pre + avg_inf + avg_post;
 
-    // Print benchmark results
-    printf("\n");
-    printf("============================================================\n");
+    // Print results
+    printf("\n============================================================\n");
     printf("  YOLOv8 Benchmark Results (%d loops)\n", LOOP_COUNT);
     printf("============================================================\n");
     printf("  Stage               Total(ms)     Avg(ms)       Share\n");
@@ -146,10 +117,9 @@ int main(int argc, char **argv)
     printf("  --------------------------------------------------------\n");
     printf("  Total               %10.2f      %8.2f      100.0%%\n",
            total_all, avg_total);
+    printf("  Average total time per loop: %.2f ms\n", avg_total);
 
-    printf("\n  Average total time per loop: %.2f ms\n", avg_total);
-
-    // ===== Draw detection boxes on last result & save =====
+    // Draw results
     char text[256];
     for (int i = 0; i < od_results.count; i++)
     {
@@ -158,42 +128,21 @@ int main(int argc, char **argv)
                det_result->box.left, det_result->box.top,
                det_result->box.right, det_result->box.bottom,
                det_result->prop);
-        int x1 = det_result->box.left;
-        int y1 = det_result->box.top;
-        int x2 = det_result->box.right;
-        int y2 = det_result->box.bottom;
-
-        draw_rectangle(&src_image, x1, y1, x2 - x1, y2 - y1, COLOR_BLUE, 3);
-
+        draw_rectangle(&src_image, det_result->box.left, det_result->box.top,
+                       det_result->box.right - det_result->box.left,
+                       det_result->box.bottom - det_result->box.top, COLOR_BLUE, 3);
         sprintf(text, "%s %.1f%%", coco_cls_to_name(det_result->cls_id), det_result->prop * 100);
-        draw_text(&src_image, text, x1, y1 - 20, COLOR_RED, 10);
+        draw_text(&src_image, text, det_result->box.left, det_result->box.top - 20, COLOR_RED, 10);
     }
-
     write_image("out.png", &src_image);
-
     printf("\nResult saved to out.png\n");
-    printf("============================================================\n");
-    printf("  Benchmark finished!\n");
-    printf("============================================================\n");
 
 out:
     deinit_post_process();
-
     ret = release_yolov8_model(&rknn_app_ctx);
     if (ret != 0)
-    {
         printf("release_yolov8_model fail! ret=%d\n", ret);
-    }
-
     if (src_image.virt_addr != NULL)
-    {
-#if defined(RV1106_1103) 
-        dma_buf_free(rknn_app_ctx.img_dma_buf.size, &rknn_app_ctx.img_dma_buf.dma_buf_fd, 
-                rknn_app_ctx.img_dma_buf.dma_buf_virt_addr);
-#else
         free(src_image.virt_addr);
-#endif
-    }
-
     return 0;
 }
