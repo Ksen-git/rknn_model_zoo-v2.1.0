@@ -678,11 +678,14 @@ int convert_image(image_buffer_t* src_img, image_buffer_t* dst_img, image_rect_t
     }
     printf("color=0x%x\n", color);
 
-    ret = convert_image_rga(src_img, dst_img, src_box, dst_box, color);
-    if (ret != 0) {
-        printf("try convert image use cpu\n");
-        ret = convert_image_cpu(src_img, dst_img, src_box, dst_box, color);
-    }
+    // ret = convert_image_rga(src_img, dst_img, src_box, dst_box, color);
+    // if (ret != 0) {
+    //     printf("try convert image use cpu\n");
+    //     ret = convert_image_cpu(src_img, dst_img, src_box, dst_box, color);
+    // }
+    // ===== 强制走CPU =====
+    printf("RGA disabled, force use CPU\n");
+    ret = convert_image_cpu(src_img, dst_img, src_box, dst_box, color);
     return ret;
 }
 
