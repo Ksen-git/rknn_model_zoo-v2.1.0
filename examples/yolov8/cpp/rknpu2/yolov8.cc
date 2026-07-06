@@ -23,10 +23,9 @@
 #include "file_utils.h"
 #include "image_utils.h"
 
-// ===== Benchmark timing accumulators (global, extern for main.cc) =====
-double g_preprocess_ms = 0.0;
-double g_inference_ms  = 0.0;
-double g_postprocess_ms = 0.0;
+// ===== RGA IM2D API =====
+#include "im2d.h"
+#include "drmrga.h"
 
 static void dump_tensor_attr(rknn_tensor_attr *attr)
 {
@@ -44,7 +43,6 @@ int init_yolov8_model(const char *model_path, rknn_app_context_t *app_ctx)
     char *model;
     rknn_context ctx = 0;
 
-    // Load RKNN Model
     model_len = read_data_from_file(model_path, &model);
     if (model == NULL)
     {
@@ -60,7 +58,6 @@ int init_yolov8_model(const char *model_path, rknn_app_context_t *app_ctx)
         return -1;
     }
 
-    // Get Model Input Output Number
     rknn_input_output_num io_num;
     ret = rknn_query(ctx, RKNN_QUERY_IN_OUT_NUM, &io_num, sizeof(io_num));
     if (ret != RKNN_SUCC)
@@ -70,7 +67,6 @@ int init_yolov8_model(const char *model_path, rknn_app_context_t *app_ctx)
     }
     printf("model input num: %d, output num: %d\n", io_num.n_input, io_num.n_output);
 
-    // Get Model Input Info
     printf("input tensors:\n");
     rknn_tensor_attr input_attrs[io_num.n_input];
     memset(input_attrs, 0, sizeof(input_attrs));
@@ -86,7 +82,6 @@ int init_yolov8_model(const char *model_path, rknn_app_context_t *app_ctx)
         dump_tensor_attr(&(input_attrs[i]));
     }
 
-    // Get Model Output Info
     printf("output tensors:\n");
     rknn_tensor_attr output_attrs[io_num.n_output];
     memset(output_attrs, 0, sizeof(output_attrs));
@@ -102,10 +97,8 @@ int init_yolov8_model(const char *model_path, rknn_app_context_t *app_ctx)
         dump_tensor_attr(&(output_attrs[i]));
     }
 
-    // Set to context
     app_ctx->rknn_ctx = ctx;
 
-    // TODO
     if (output_attrs[0].qnt_type == RKNN_TENSOR_QNT_AFFINE_ASYMMETRIC && output_attrs[0].type == RKNN_TENSOR_INT8)
     {
         app_ctx->is_quant = true;
@@ -161,68 +154,142 @@ int release_yolov8_model(rknn_app_context_t *app_ctx)
     return 0;
 }
 
+// ==================== 原同步推理函数（保留但弃用） ====================
 int inference_yolov8_model(rknn_app_context_t *app_ctx, image_buffer_t *img, object_detect_result_list *od_results)
 {
-    int ret;
-    image_buffer_t dst_img;
-    letterbox_t letter_box;
-    rknn_input inputs[app_ctx->io_num.n_input];
-    rknn_output outputs[app_ctx->io_num.n_output];
-    const float nms_threshold = NMS_THRESH;      // 默认的NMS阈值
-    const float box_conf_threshold = BOX_THRESH; // 默认的置信度阈值
-    int bg_color = 114;
+    printf("WARNING: inference_yolov8_model is deprecated, use pipeline instead.\n");
+    return -1;
+}
 
-    if ((!app_ctx) || !(img) || (!od_results))
+// ==================== 流水线函数实现（RGA加速预处理） ====================
+
+int preprocess_frame(rknn_app_context_t *app_ctx, image_buffer_t *src_img, FrameData *data)
+{
+    if (!app_ctx || !src_img || !data)
+        return -1;
+
+    memset(data, 0, sizeof(FrameData));
+    data->frame_id = 0;
+    data->src_img = *src_img;
+
+    data->dst_img.width = app_ctx->model_width;
+    data->dst_img.height = app_ctx->model_height;
+    data->dst_img.format = IMAGE_FORMAT_RGB888;
+    data->dst_img.size = get_image_size(&data->dst_img);
+    data->dst_img.virt_addr = (unsigned char *)malloc(data->dst_img.size);
+    if (!data->dst_img.virt_addr)
     {
+        printf("preprocess_frame: malloc dst_img failed\n");
         return -1;
     }
 
-    memset(od_results, 0x00, sizeof(*od_results));
-    memset(&letter_box, 0, sizeof(letterbox_t));
-    memset(&dst_img, 0, sizeof(image_buffer_t));
-    memset(inputs, 0, sizeof(inputs));
-    memset(outputs, 0, sizeof(outputs));
+    // ===== 使用RGA直接进行预处理 =====
+    int src_w = src_img->width;
+    int src_h = src_img->height;
+    int dst_w = data->dst_img.width;
+    int dst_h = data->dst_img.height;
 
-    // ===== Pre Process (timed) =====
-    auto t_pre_start = std::chrono::high_resolution_clock::now();
-    dst_img.width = app_ctx->model_width;
-    dst_img.height = app_ctx->model_height;
-    dst_img.format = IMAGE_FORMAT_RGB888;
-    dst_img.size = get_image_size(&dst_img);
-    dst_img.virt_addr = (unsigned char *)malloc(dst_img.size);
-    if (dst_img.virt_addr == NULL)
+    // 计算letterbox参数（保持宽高比）
+    float scale_w = (float)dst_w / src_w;
+    float scale_h = (float)dst_h / src_h;
+    float scale = (scale_w < scale_h) ? scale_w : scale_h;
+
+    int resize_w = (int)(src_w * scale);
+    int resize_h = (int)(src_h * scale);
+    // 对齐要求
+    if (resize_w % 4 != 0)
+        resize_w -= resize_w % 4;
+    if (resize_h % 2 != 0)
+        resize_h -= resize_h % 2;
+
+    int pad_x = (dst_w - resize_w) / 2;
+    int pad_y = (dst_h - resize_h) / 2;
+    // 对齐
+    if (pad_x % 2 != 0)
+        pad_x -= pad_x % 2;
+    if (pad_y % 2 != 0)
+        pad_y -= pad_y % 2;
+
+    // 设置letterbox（后处理需要）
+    data->letter_box.scale = scale;
+    data->letter_box.x_pad = pad_x;
+    data->letter_box.y_pad = pad_y;
+
+    // ---- 使用RGA IM2D API ----
+    // 1. 用RGA填充背景色（114灰色）
+    rga_buffer_t dst_buf = wrapbuffer_virtualaddr(data->dst_img.virt_addr,
+                                                  dst_w, dst_h, RK_FORMAT_RGB_888);
+    im_rect fill_rect = {0, 0, dst_w, dst_h};
+    imfill(dst_buf, fill_rect, 0x727272); // 114的RGB值
+
+    // 2. 用RGA做缩放（源图缩放到resize_w x resize_h）
+    rga_buffer_t src_buf = wrapbuffer_virtualaddr(src_img->virt_addr,
+                                                  src_w, src_h, RK_FORMAT_RGB_888);
+
+    im_rect srect = {0, 0, src_w, src_h};
+    im_rect drect = {pad_x, pad_y, resize_w, resize_h};
+
+    IM_STATUS ret_rga = improcess(src_buf, dst_buf, src_buf, srect, drect, srect, 0);
+    if (ret_rga != IM_STATUS_SUCCESS)
     {
-        printf("malloc buffer size:%d fail!\n", dst_img.size);
-        return -1;
+        printf("RGA improcess failed: %s, falling back to convert_image_with_letterbox\n", imStrError(ret_rga));
+        // RGA失败，回退到原始方式
+        free(data->dst_img.virt_addr);
+        data->dst_img.virt_addr = NULL;
+
+        data->dst_img.width = app_ctx->model_width;
+        data->dst_img.height = app_ctx->model_height;
+        data->dst_img.format = IMAGE_FORMAT_RGB888;
+        data->dst_img.size = get_image_size(&data->dst_img);
+        data->dst_img.virt_addr = (unsigned char *)malloc(data->dst_img.size);
+        if (!data->dst_img.virt_addr)
+        {
+            printf("preprocess_frame: malloc dst_img failed\n");
+            return -1;
+        }
+
+        int ret = convert_image_with_letterbox(src_img, &data->dst_img, &data->letter_box, 114);
+        if (ret < 0)
+        {
+            printf("convert_image_with_letterbox fail! ret=%d\n", ret);
+            free(data->dst_img.virt_addr);
+            data->dst_img.virt_addr = NULL;
+            return -1;
+        }
+    }
+    else
+    {
+        printf("RGA preprocess OK: %dx%d -> %dx%d (resize %dx%d, pad %d,%d)\n",
+               src_w, src_h, dst_w, dst_h, resize_w, resize_h, pad_x, pad_y);
     }
 
-    // letterbox
-    ret = convert_image_with_letterbox(img, &dst_img, &letter_box, bg_color);
+    // 设置输入张量
+    data->inputs[0].index = 0;
+    data->inputs[0].type = RKNN_TENSOR_UINT8;
+    data->inputs[0].fmt = RKNN_TENSOR_NHWC;
+    data->inputs[0].size = data->dst_img.size;
+    data->inputs[0].buf = data->dst_img.virt_addr;
+
+    data->valid = true;
+    data->processed = false;
+    data->outputs = NULL;
+    data->output_count = 0;
+    return 0;
+}
+
+int inference_frame(rknn_app_context_t *app_ctx, FrameData *data)
+{
+    // ...（和pipeline分支一样）
+    if (!app_ctx || !data || !data->valid)
+        return -1;
+
+    int ret = rknn_inputs_set(app_ctx->rknn_ctx, app_ctx->io_num.n_input, data->inputs);
     if (ret < 0)
     {
-        printf("convert_image_with_letterbox fail! ret=%d\n", ret);
-        return -1;
-    }
-    auto t_pre_end = std::chrono::high_resolution_clock::now();
-    g_preprocess_ms += std::chrono::duration<double, std::milli>(t_pre_end - t_pre_start).count();
-    // ===== Pre Process end =====
-
-    // ===== Inference: Set Input + Run + Get Output (timed) =====
-    auto t_inf_start = std::chrono::high_resolution_clock::now();
-    inputs[0].index = 0;
-    inputs[0].type = RKNN_TENSOR_UINT8;
-    inputs[0].fmt = RKNN_TENSOR_NHWC;
-    inputs[0].size = app_ctx->model_width * app_ctx->model_height * app_ctx->model_channel;
-    inputs[0].buf = dst_img.virt_addr;
-
-    ret = rknn_inputs_set(app_ctx->rknn_ctx, app_ctx->io_num.n_input, inputs);
-    if (ret < 0)
-    {
-        printf("rknn_input_set fail! ret=%d\n", ret);
+        printf("rknn_inputs_set fail! ret=%d\n", ret);
         return -1;
     }
 
-    // Run
     ret = rknn_run(app_ctx->rknn_ctx, nullptr);
     if (ret < 0)
     {
@@ -230,38 +297,82 @@ int inference_yolov8_model(rknn_app_context_t *app_ctx, image_buffer_t *img, obj
         return -1;
     }
 
-    // Get Output
-    memset(outputs, 0, sizeof(outputs));
-    for (int i = 0; i < app_ctx->io_num.n_output; i++)
+    int num_outputs = app_ctx->io_num.n_output;
+    rknn_output *outputs = (rknn_output *)malloc(num_outputs * sizeof(rknn_output));
+    if (!outputs)
+    {
+        printf("malloc outputs failed\n");
+        return -1;
+    }
+    memset(outputs, 0, num_outputs * sizeof(rknn_output));
+    for (int i = 0; i < num_outputs; i++)
     {
         outputs[i].index = i;
         outputs[i].want_float = (!app_ctx->is_quant);
+        outputs[i].is_prealloc = 0;
     }
-    ret = rknn_outputs_get(app_ctx->rknn_ctx, app_ctx->io_num.n_output, outputs, NULL);
+
+    ret = rknn_outputs_get(app_ctx->rknn_ctx, num_outputs, outputs, NULL);
     if (ret < 0)
     {
         printf("rknn_outputs_get fail! ret=%d\n", ret);
-        goto out;
+        free(outputs);
+        return -1;
     }
-    auto t_inf_end = std::chrono::high_resolution_clock::now();
-    g_inference_ms += std::chrono::duration<double, std::milli>(t_inf_end - t_inf_start).count();
-    // ===== Inference end =====
 
-    // ===== Post Process (timed) =====
-    auto t_post_start = std::chrono::high_resolution_clock::now();
-    post_process(app_ctx, outputs, &letter_box, box_conf_threshold, nms_threshold, od_results);
-    auto t_post_end = std::chrono::high_resolution_clock::now();
-    g_postprocess_ms += std::chrono::duration<double, std::milli>(t_post_end - t_post_start).count();
-    // ===== Post Process end =====
-
-    // Remeber to release rknn output
-    rknn_outputs_release(app_ctx->rknn_ctx, app_ctx->io_num.n_output, outputs);
-
-out:
-    if (dst_img.virt_addr != NULL)
+    data->output_count = num_outputs;
+    data->outputs = (rknn_output *)malloc(num_outputs * sizeof(rknn_output));
+    if (!data->outputs)
     {
-        free(dst_img.virt_addr);
+        printf("malloc data->outputs failed\n");
+        rknn_outputs_release(app_ctx->rknn_ctx, num_outputs, outputs);
+        free(outputs);
+        return -1;
+    }
+    memset(data->outputs, 0, num_outputs * sizeof(rknn_output));
+
+    for (int i = 0; i < num_outputs; i++)
+    {
+        data->outputs[i].index = i;
+        data->outputs[i].want_float = outputs[i].want_float;
+        data->outputs[i].size = outputs[i].size;
+        data->outputs[i].buf = malloc(outputs[i].size);
+        if (!data->outputs[i].buf)
+        {
+            printf("malloc output buffer %d failed\n", i);
+            for (int j = 0; j < i; j++)
+                free(data->outputs[j].buf);
+            free(data->outputs);
+            data->outputs = NULL;
+            rknn_outputs_release(app_ctx->rknn_ctx, num_outputs, outputs);
+            free(outputs);
+            return -1;
+        }
+        memcpy(data->outputs[i].buf, outputs[i].buf, outputs[i].size);
     }
 
-    return ret;
+    rknn_outputs_release(app_ctx->rknn_ctx, num_outputs, outputs);
+    free(outputs);
+
+    data->processed = false;
+    return 0;
+}
+
+int postprocess_frame(rknn_app_context_t *app_ctx, FrameData *data, object_detect_result_list *results)
+{
+    if (!app_ctx || !data || !data->valid || !data->outputs)
+        return -1;
+
+    const float nms_threshold = NMS_THRESH;
+    const float box_conf_threshold = BOX_THRESH;
+
+    post_process(app_ctx, (void *)data->outputs, &data->letter_box, box_conf_threshold, nms_threshold, results);
+
+    if (results)
+    {
+        memcpy(&data->results, results, sizeof(object_detect_result_list));
+    }
+
+    data->processed = true;
+    return 0;
 }
