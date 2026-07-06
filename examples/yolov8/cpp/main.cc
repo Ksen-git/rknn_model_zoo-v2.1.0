@@ -1,29 +1,19 @@
+cat > examples / yolov8 / cpp / main.cc << 'EOF'
 // Copyright (c) 2023 by Rockchip Electronics Co., Ltd. All Rights Reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
 
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
 #include "yolov8.h"
 #include "image_utils.h"
 #include "file_utils.h"
 #include "image_drawing.h"
 #include <chrono>
 
-extern double g_preprocess_ms;
+          extern double g_preprocess_ms;
 extern double g_inference_ms;
 extern double g_postprocess_ms;
 
@@ -119,24 +109,6 @@ int main(int argc, char **argv)
            total_all, avg_total);
     printf("  Average total time per loop: %.2f ms\n", avg_total);
 
-    // Draw results
-    char text[256];
-    for (int i = 0; i < od_results.count; i++)
-    {
-        object_detect_result *det_result = &(od_results.results[i]);
-        printf("%s @ (%d %d %d %d) %.3f\n", coco_cls_to_name(det_result->cls_id),
-               det_result->box.left, det_result->box.top,
-               det_result->box.right, det_result->box.bottom,
-               det_result->prop);
-        draw_rectangle(&src_image, det_result->box.left, det_result->box.top,
-                       det_result->box.right - det_result->box.left,
-                       det_result->box.bottom - det_result->box.top, COLOR_BLUE, 3);
-        sprintf(text, "%s %.1f%%", coco_cls_to_name(det_result->cls_id), det_result->prop * 100);
-        draw_text(&src_image, text, det_result->box.left, det_result->box.top - 20, COLOR_RED, 10);
-    }
-    write_image("out.png", &src_image);
-    printf("\nResult saved to out.png\n");
-
 out:
     deinit_post_process();
     ret = release_yolov8_model(&rknn_app_ctx);
@@ -146,3 +118,4 @@ out:
         free(src_image.virt_addr);
     return 0;
 }
+EOF
