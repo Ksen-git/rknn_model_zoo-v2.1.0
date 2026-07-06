@@ -12,9 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-/*-------------------------------------------
-                Includes
--------------------------------------------*/
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -26,14 +23,10 @@
 #include "image_drawing.h"
 #include <chrono>
 
-// Benchmark timing accumulators from yolov8.cc
 extern double g_preprocess_ms;
 extern double g_inference_ms;
 extern double g_postprocess_ms;
 
-/*-------------------------------------------
-                Main Function
--------------------------------------------*/
 int main(int argc, char **argv)
 {
     if (argc != 3)
@@ -49,12 +42,18 @@ int main(int argc, char **argv)
     rknn_app_context_t rknn_app_ctx;
     memset(&rknn_app_ctx, 0, sizeof(rknn_app_context_t));
 
-    // Declare all variables at the top (avoid goto crossing initialization)
+    // ===== 所有变量提前声明（避免goto问题） =====
     image_buffer_t src_image;
     object_detect_result_list od_results;
     const int LOOP_COUNT = 100;
     double avg_pre, avg_inf, avg_post, total_all, avg_total;
+    double total_wall_ms; // 总耗时(毫秒)
+    double real_fps;      // 帧率
     char text[256];
+
+    // 总计时变量
+    std::chrono::time_point<std::chrono::high_resolution_clock> total_start, total_end;
+    // ===========================================
 
     init_post_process();
 
@@ -93,6 +92,10 @@ int main(int argc, char **argv)
 
     // ===== Benchmark: 100 loops =====
     printf("\nBenchmark: running %d loops...\n", LOOP_COUNT);
+
+    // 记录总开始时间
+    total_start = std::chrono::high_resolution_clock::now();
+
     for (int loop = 0; loop < LOOP_COUNT; loop++)
     {
         ret = inference_yolov8_model(&rknn_app_ctx, &src_image, &od_results);
@@ -107,14 +110,19 @@ int main(int argc, char **argv)
         }
     }
 
-    // ===== Calculate averages =====
+    // 记录总结束时间
+    total_end = std::chrono::high_resolution_clock::now();
+    total_wall_ms = std::chrono::duration<double, std::milli>(total_end - total_start).count();
+
+    // ===== 计算平均值和帧率 =====
     avg_pre = g_preprocess_ms / LOOP_COUNT;
     avg_inf = g_inference_ms / LOOP_COUNT;
     avg_post = g_postprocess_ms / LOOP_COUNT;
     total_all = g_preprocess_ms + g_inference_ms + g_postprocess_ms;
     avg_total = avg_pre + avg_inf + avg_post;
+    real_fps = LOOP_COUNT / (total_wall_ms / 1000.0); // 帧数 / 总耗时(秒)
 
-    // ===== Print benchmark results =====
+    // ===== 打印结果 =====
     printf("\n");
     printf("============================================================\n");
     printf("  YOLOv8 Benchmark Results (%d loops)\n", LOOP_COUNT);
@@ -130,9 +138,12 @@ int main(int argc, char **argv)
     printf("  --------------------------------------------------------\n");
     printf("  Total               %10.2f      %8.2f      100.0%%\n",
            total_all, avg_total);
-    printf("\n  Average total time per loop: %.2f ms\n", avg_total);
+    printf("\n  Wall time:          %.2f ms\n", total_wall_ms);
+    printf("  Average per frame:   %.2f ms\n", total_wall_ms / LOOP_COUNT);
+    printf("  Real FPS:            %.1f\n", real_fps);
+    printf("============================================================\n");
 
-    // ===== Draw detection boxes on last result =====
+    // ===== Draw detection boxes =====
     for (int i = 0; i < od_results.count; i++)
     {
         object_detect_result *det_result = &(od_results.results[i]);
