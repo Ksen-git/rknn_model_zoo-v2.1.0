@@ -33,7 +33,6 @@
 #include "dma_alloc.hpp"
 #endif
 
-// ==================== 线程安全队列 ====================
 template <typename T>
 class SafeQueue
 {
@@ -77,20 +76,17 @@ private:
     bool stop_ = false;
 };
 
-// ==================== 全局计时变量 ====================
 std::mutex g_timer_mutex;
 double g_pre_total_ms = 0.0;
 double g_inf_total_ms = 0.0;
 double g_post_total_ms = 0.0;
 int g_frame_count = 0;
 
-// ==================== 主函数 ====================
 int main(int argc, char **argv)
 {
     if (argc != 4)
     {
         printf("Usage: %s <model_path> <image_path> <loop_count>\n", argv[0]);
-        printf("  loop_count: number of frames to process (e.g., 100)\n");
         return -1;
     }
 
@@ -98,185 +94,113 @@ int main(int argc, char **argv)
     const char *image_path = argv[2];
     const int LOOP_COUNT = atoi(argv[3]);
     if (LOOP_COUNT <= 0)
-    {
-        printf("loop_count must be positive\n");
         return -1;
-    }
 
     int ret;
     rknn_app_context_t rknn_app_ctx;
     memset(&rknn_app_ctx, 0, sizeof(rknn_app_context_t));
 
+    // ===== 所有变量提前声明 =====
     image_buffer_t template_img;
     memset(&template_img, 0, sizeof(image_buffer_t));
-
     SafeQueue<FrameData *> pre_queue;
     SafeQueue<FrameData *> inf_queue;
     std::atomic<bool> running(true);
     std::atomic<int> frame_counter(0);
     std::atomic<int> processed_counter(0);
     int total_frames = 0;
+    std::thread pre_thread, inf_thread, post_thread;
 
-    std::thread pre_thread;
-    std::thread inf_thread;
-    std::thread post_thread;
+    // 提前声明计时变量（关键！避免goto跨初始化）
+    std::chrono::time_point<std::chrono::high_resolution_clock> t_pipeline_start, t_pipeline_end;
+    double pipeline_total_ms = 0.0;
 
     init_post_process();
 
     ret = init_yolov8_model(model_path, &rknn_app_ctx);
     if (ret != 0)
     {
-        printf("init_yolov8_model fail! ret=%d model_path=%s\n", ret, model_path);
+        printf("init_yolov8_model fail!\n");
         goto out;
     }
 
-    // 读取第一张图片获取尺寸
     ret = read_image(image_path, &template_img);
     if (ret != 0)
     {
-        printf("read image fail! ret=%d image_path=%s\n", ret, image_path);
+        printf("read image fail!\n");
         goto out;
     }
     free(template_img.virt_addr);
     template_img.virt_addr = NULL;
 
-    // ===== 流水线总计时 =====
-    auto t_pipeline_start = std::chrono::high_resolution_clock::now();
+    t_pipeline_start = std::chrono::high_resolution_clock::now();
 
-    // ---------- 预处理线程 ----------
+    // 预处理线程
     pre_thread = std::thread([&]()
                              {
-        while (running)
-        {
+        while (running) {
             int id = frame_counter.fetch_add(1);
-            if (id >= LOOP_COUNT)
-                break;
-
+            if (id >= LOOP_COUNT) break;
             image_buffer_t src_img;
             memset(&src_img, 0, sizeof(image_buffer_t));
-            if (read_image(image_path, &src_img) != 0)
-            {
-                printf("pre: read image fail at frame %d\n", id);
-                break;
-            }
-
+            if (read_image(image_path, &src_img) != 0) break;
             FrameData *data = new FrameData();
             auto t_start = std::chrono::high_resolution_clock::now();
-
-            if (preprocess_frame(&rknn_app_ctx, &src_img, data) != 0)
-            {
-                printf("pre: preprocess_frame fail at frame %d\n", id);
-                delete data;
-                free(src_img.virt_addr);
-                break;
-            }
+            if (preprocess_frame(&rknn_app_ctx, &src_img, data) != 0) { delete data; free(src_img.virt_addr); break; }
             data->frame_id = id;
             free(src_img.virt_addr);
-
             auto t_end = std::chrono::high_resolution_clock::now();
             double elapsed_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
-
-            {
-                std::lock_guard<std::mutex> lock(g_timer_mutex);
-                g_pre_total_ms += elapsed_ms;
-            }
-
+            { std::lock_guard<std::mutex> lock(g_timer_mutex); g_pre_total_ms += elapsed_ms; }
             pre_queue.push(data);
         }
         pre_queue.stop(); });
 
-    // ---------- 推理线程 ----------
+    // 推理线程
     inf_thread = std::thread([&]()
                              {
-        while (running)
-        {
+        while (running) {
             FrameData *data = pre_queue.pop();
-            if (!data)
-                break;
-
+            if (!data) break;
             auto t_start = std::chrono::high_resolution_clock::now();
-
-            if (inference_frame(&rknn_app_ctx, data) != 0)
-            {
-                printf("inf: inference_frame fail at frame %d\n", data->frame_id);
-                free(data->dst_img.virt_addr);
-                delete data;
-                continue;
-            }
-
+            if (inference_frame(&rknn_app_ctx, data) != 0) { free(data->dst_img.virt_addr); delete data; continue; }
             auto t_end = std::chrono::high_resolution_clock::now();
             double elapsed_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
-
-            {
-                std::lock_guard<std::mutex> lock(g_timer_mutex);
-                g_inf_total_ms += elapsed_ms;
-            }
-
+            { std::lock_guard<std::mutex> lock(g_timer_mutex); g_inf_total_ms += elapsed_ms; }
             inf_queue.push(data);
         }
         inf_queue.stop(); });
 
-    // ---------- 后处理线程 ----------
+    // 后处理线程
     post_thread = std::thread([&]()
                               {
         object_detect_result_list results;
-        while (running)
-        {
+        while (running) {
             FrameData *data = inf_queue.pop();
-            if (!data)
-                break;
-
+            if (!data) break;
             auto t_start = std::chrono::high_resolution_clock::now();
-
-            if (postprocess_frame(&rknn_app_ctx, data, &results) != 0)
-            {
-                printf("post: postprocess_frame fail at frame %d\n", data->frame_id);
+            if (postprocess_frame(&rknn_app_ctx, data, &results) != 0) {
                 free(data->dst_img.virt_addr);
-                if (data->outputs)
-                {
-                    for (int i = 0; i < data->output_count; i++)
-                        free(data->outputs[i].buf);
-                    free(data->outputs);
-                }
-                delete data;
-                continue;
+                if (data->outputs) { for (int i = 0; i < data->output_count; i++) free(data->outputs[i].buf); free(data->outputs); }
+                delete data; continue;
             }
-
             auto t_end = std::chrono::high_resolution_clock::now();
             double elapsed_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
-
-            {
-                std::lock_guard<std::mutex> lock(g_timer_mutex);
-                g_post_total_ms += elapsed_ms;
-                g_frame_count++;
-            }
-
-            // 释放资源
+            { std::lock_guard<std::mutex> lock(g_timer_mutex); g_post_total_ms += elapsed_ms; g_frame_count++; }
             free(data->dst_img.virt_addr);
-            if (data->outputs)
-            {
-                for (int i = 0; i < data->output_count; i++)
-                    free(data->outputs[i].buf);
-                free(data->outputs);
-            }
+            if (data->outputs) { for (int i = 0; i < data->output_count; i++) free(data->outputs[i].buf); free(data->outputs); }
             delete data;
-
             int done = processed_counter.fetch_add(1) + 1;
-            if (done % 10 == 0 || done == LOOP_COUNT)
-            {
-                printf("  Processed %d/%d frames\n", done, LOOP_COUNT);
-            }
+            if (done % 10 == 0 || done == LOOP_COUNT) printf("  Processed %d/%d frames\n", done, LOOP_COUNT);
         } });
 
-    // ===== 等待所有线程结束 =====
     pre_thread.join();
     inf_thread.join();
     post_thread.join();
 
-    auto t_pipeline_end = std::chrono::high_resolution_clock::now();
-    double pipeline_total_ms = std::chrono::duration<double, std::milli>(t_pipeline_end - t_pipeline_start).count();
+    t_pipeline_end = std::chrono::high_resolution_clock::now();
+    pipeline_total_ms = std::chrono::duration<double, std::milli>(t_pipeline_end - t_pipeline_start).count();
 
-    // ===== 打印性能统计 =====
     total_frames = g_frame_count;
     if (total_frames > 0)
     {
@@ -286,21 +210,16 @@ int main(int argc, char **argv)
         double avg_total = avg_pre + avg_inf + avg_post;
         double total_all = g_pre_total_ms + g_inf_total_ms + g_post_total_ms;
         double real_fps = total_frames / (pipeline_total_ms / 1000.0);
-
         printf("\n============================================================\n");
         printf("  YOLOv8 Pipeline Benchmark Results (%d frames)\n", total_frames);
         printf("============================================================\n");
         printf("  Stage               Total(ms)     Avg(ms)       Share\n");
         printf("  --------------------------------------------------------\n");
-        printf("  Preprocess          %10.2f      %8.2f       %5.1f%%\n",
-               g_pre_total_ms, avg_pre, (g_pre_total_ms / total_all) * 100.0);
-        printf("  Inference           %10.2f      %8.2f       %5.1f%%\n",
-               g_inf_total_ms, avg_inf, (g_inf_total_ms / total_all) * 100.0);
-        printf("  Postprocess         %10.2f      %8.2f       %5.1f%%\n",
-               g_post_total_ms, avg_post, (g_post_total_ms / total_all) * 100.0);
+        printf("  Preprocess          %10.2f      %8.2f       %5.1f%%\n", g_pre_total_ms, avg_pre, (g_pre_total_ms / total_all) * 100);
+        printf("  Inference           %10.2f      %8.2f       %5.1f%%\n", g_inf_total_ms, avg_inf, (g_inf_total_ms / total_all) * 100);
+        printf("  Postprocess         %10.2f      %8.2f       %5.1f%%\n", g_post_total_ms, avg_post, (g_post_total_ms / total_all) * 100);
         printf("  --------------------------------------------------------\n");
-        printf("  Total               %10.2f      %8.2f      100.0%%\n",
-               total_all, avg_total);
+        printf("  Total               %10.2f      %8.2f      100.0%%\n", total_all, avg_total);
         printf("\n  Pipeline wall time:  %.2f ms\n", pipeline_total_ms);
         printf("  Average per frame:   %.2f ms\n", pipeline_total_ms / total_frames);
         printf("  Real FPS:            %.1f\n", real_fps);
@@ -309,25 +228,14 @@ int main(int argc, char **argv)
 
 out:
     deinit_post_process();
-
-    ret = release_yolov8_model(&rknn_app_ctx);
-    if (ret != 0)
-    {
-        printf("release_yolov8_model fail! ret=%d\n", ret);
-    }
-
+    release_yolov8_model(&rknn_app_ctx);
     if (template_img.virt_addr != NULL)
-    {
         free(template_img.virt_addr);
-        template_img.virt_addr = NULL;
-    }
-
     if (pre_thread.joinable())
         pre_thread.join();
     if (inf_thread.joinable())
         inf_thread.join();
     if (post_thread.joinable())
         post_thread.join();
-
     return 0;
 }
