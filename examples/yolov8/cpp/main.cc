@@ -107,6 +107,7 @@ int main(int argc, char **argv)
     rknn_app_context_t rknn_app_ctx;
     memset(&rknn_app_ctx, 0, sizeof(rknn_app_context_t));
 
+    // ===== 所有变量提前声明（避免goto跨初始化） =====
     image_buffer_t template_img;
     memset(&template_img, 0, sizeof(image_buffer_t));
 
@@ -120,6 +121,11 @@ int main(int argc, char **argv)
     std::thread pre_thread;
     std::thread inf_thread;
     std::thread post_thread;
+
+    // 流水线总计时变量（提前声明）
+    auto t_pipeline_start = std::chrono::high_resolution_clock::now();
+    auto t_pipeline_end = std::chrono::high_resolution_clock::now();
+    double pipeline_total_ms = 0.0;
 
     init_post_process();
 
@@ -140,8 +146,8 @@ int main(int argc, char **argv)
     free(template_img.virt_addr);
     template_img.virt_addr = NULL;
 
-    // ===== 流水线总计时 =====
-    auto t_pipeline_start = std::chrono::high_resolution_clock::now();
+    // ===== 流水线总计时开始 =====
+    t_pipeline_start = std::chrono::high_resolution_clock::now();
 
     // ---------- 预处理线程 ----------
     pre_thread = std::thread([&]()
@@ -273,8 +279,9 @@ int main(int argc, char **argv)
     inf_thread.join();
     post_thread.join();
 
-    auto t_pipeline_end = std::chrono::high_resolution_clock::now();
-    double pipeline_total_ms = std::chrono::duration<double, std::milli>(t_pipeline_end - t_pipeline_start).count();
+    // ===== 流水线总计时结束 =====
+    t_pipeline_end = std::chrono::high_resolution_clock::now();
+    pipeline_total_ms = std::chrono::duration<double, std::milli>(t_pipeline_end - t_pipeline_start).count();
 
     // ===== 打印性能统计 =====
     total_frames = g_frame_count;
