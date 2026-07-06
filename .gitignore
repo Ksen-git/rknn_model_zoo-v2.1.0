@@ -1,0 +1,22 @@
+# Model files
+*.rknn
+
+# Image files
+*.jpg
+*.jpeg
+*.png
+*.bmp
+
+# Python files/dirs
+python/
+**/python/
+
+# Build output
+build*/
+*.o
+*.so
+*.a
+
+# OS files
+.DS_Store
+Thumbs.db
